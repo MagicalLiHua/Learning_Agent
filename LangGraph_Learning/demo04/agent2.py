@@ -68,7 +68,7 @@ graph = graph_builder.compile(
 )
 
 # 绘制可视化图表
-graph.get_graph().draw_png('./graph.png')
+# graph.get_graph().draw_png('./graph.png')
 
 
 def run_with_approval():

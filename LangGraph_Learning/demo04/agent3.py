@@ -1,0 +1,145 @@
+from typing import TypedDict, Annotated
+import json
+from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_ollama import ChatOllama
+from langgraph.constants import START, END
+from langgraph.graph import add_messages, StateGraph
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+from tools import get_weather, write_file
+
+
+# 定义 Agent 的状态结构
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+# 初始化本地大语言模型
+llm = ChatOllama(base_url="http://10.160.108.2:11434", model="qwen3-vl:8b", reasoning=False)
+tools = [get_weather, write_file]
+llm_with_tools = llm.bind_tools(tools)
+
+
+# 聊天机器人节点
+# def chat_node(state: AgentState):
+#     messages = state["messages"]
+#     system_prompt = """你是一个智能助手，具备以下能力：
+#                     1. 查询天气信息
+#                     2. 结果写入文件
+#                     请根据用户的需求，选择合适的工具来完成任务。回答要准确、友好、专业。"""
+#
+#     if not any(isinstance(msg, SystemMessage) for msg in messages):
+#         messages = [SystemMessage(content=system_prompt)] + messages
+#
+#     result = llm_with_tools.invoke(messages)
+#     return {"messages": [result]}
+
+def chat_node(state: AgentState):
+    messages = state["messages"]
+    # 强化了最后一句，防止模型死循环
+    system_prompt = """你是一个智能助手，具备以下能力：
+                    1. 查询天气信息
+                    2. 结果写入文件
+                    请根据用户的需求，选择合适的工具。
+                    ⚠️ 极其重要：如果工具已经返回了查询结果，请直接用自然语言回答用户，绝对不要再次重复调用工具！"""
+
+    if not any(isinstance(msg, SystemMessage) for msg in messages):
+        messages = [SystemMessage(content=system_prompt)] + messages
+
+    result = llm_with_tools.invoke(messages)
+    return {"messages": [result]}
+
+
+# 定义工具节点
+tool_node = ToolNode(tools=tools)
+
+
+# 动态路由：chat_node 之后
+def route_after_chat(state: AgentState):
+    """判断是否需要调用工具"""
+    last_message = state["messages"][-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tool_node"
+    return END
+
+
+# 构建状态图
+graph_builder = StateGraph(AgentState)
+
+# 添加节点
+graph_builder.add_node("chat_node", chat_node)
+graph_builder.add_node("tool_node", tool_node)
+
+# 添加边
+graph_builder.add_edge(START, "chat_node")
+graph_builder.add_conditional_edges("chat_node", route_after_chat, ["tool_node", END])
+graph_builder.add_edge("tool_node", "chat_node")
+
+# 编译图结构 - 关键：使用 interrupt_before 在工具节点前中断
+memory = MemorySaver()
+graph = graph_builder.compile(
+    checkpointer=memory,
+    interrupt_before=["tool_node"]  # 在执行工具前中断，等待人工确认
+)
+
+def run_with_approval():
+    """运行带人工确认的工作流 (工业级 While 循环版)"""
+    config = {"configurable": {"thread_id": "1"}}
+    print("【用户】北京天气怎么样\n")
+
+    # 第一次启动图
+    result = graph.invoke({"messages": ["北京天气怎么样"]}, config)
+
+    # ⭐️ 核心改进：使用 while 循环，应对 Agent 可能的多次工具调用
+    while True:
+        snapshot = graph.get_state(config)
+
+        # 如果 next 为空，说明已经走到了 END，图彻底运行完毕，打破循环
+        if not snapshot.next:
+            break
+
+        # 如果图停在了 tool_node 门外，说明大模型想调工具
+        if "tool_node" in snapshot.next:
+            print("\n⏸️ 发现工具调用请求，等待人工确认...")
+
+            last_message = snapshot.values["messages"][-1]
+            if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+                for idx, tool_call in enumerate(last_message.tool_calls, 1):
+                    print(f"[{idx}] 工具名称: {tool_call['name']}")
+                    print(f"    调用参数: {json.dumps(tool_call['args'], ensure_ascii=False)}")
+
+                approval = input("是否批准执行？(yes/no): ").strip().lower()
+
+                if approval in ['yes', 'y']:
+                    print("✅ 工具调用已批准，继续执行...\n")
+                    # 继续执行，把控制权交回给图
+                    result = graph.invoke(None, config)
+
+                elif approval in ['no', 'n']:
+                    print("🛑 工具调用已被拒绝，正在通知大模型...\n")
+                    tool_messages = []
+                    for tool_call in last_message.tool_calls:
+                        tool_messages.append(
+                            ToolMessage(
+                                content="【系统通知】用户拒绝了此次工具调用，请直接回答用户或询问下一步操作。",
+                                tool_call_id=tool_call["id"]
+                            )
+                        )
+                    # 核心修复：必须加上 as_node="tool_node"，伪装成工具已经执行完毕
+                    graph.update_state(config, {"messages": tool_messages}, as_node="tool_node")
+                    # 带着拒绝消息继续运行
+                    result = graph.invoke(None, config)
+
+    # 循环结束，意味着流程安全到达 END，此时打印最终结果
+    print("\n🎉 最终回复:")
+    final_message = result["messages"][-1]
+
+    # 调试小贴士：如果 content 还是空的，我们就把整个对象打印出来，看看它到底是个啥妖怪
+    if final_message.content:
+        print(final_message.content)
+    else:
+        print(f"[警告] 模型返回了非文本或空内容，原始数据如下：\n{final_message}")
+
+
+if __name__ == "__main__":
+    run_with_approval()
